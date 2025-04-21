@@ -1,124 +1,93 @@
-import boto3
-import csv
-import io
+import json
 import os
-from datetime import datetime, timedelta
+# boto3, time 등 Athena 관련 import 제거
 
-# 환경 변수에서 설정값 가져오기 (기본값 설정)
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', 'your-cost-data-bucket-name') # 실제 버킷 이름으로 변경 필요
-RECENT_PERIOD_DAYS = int(os.environ.get('RECENT_PERIOD_DAYS', 7))
-COMPARISON_PERIOD_DAYS = int(os.environ.get('COMPARISON_PERIOD_DAYS', 30))
-COST_THRESHOLD_PERCENTAGE = float(os.environ.get('COST_THRESHOLD_PERCENTAGE', 1.0)) # 이전 기간 대비 비용 비율 (%)
-FILE_SUFFIX = os.environ.get('FILE_SUFFIX', '_sorted_costs.csv') # 파일 이름 접미사
+# 새로 만든 모듈 import
+import cost_analyzer
+import athena_query_handler # Athena 쿼리 핸들러 모듈 임포트
 
-s3_client = boto3.client('s3')
+# Athena 관련 환경 변수 설정은 athena_query_handler.py 로 이동
 
-def get_costs_for_period(bucket, start_date, end_date):
-    """지정된 기간 동안의 비용 데이터를 S3에서 읽어 집계합니다."""
-    costs = {} # {"Service::Operation": total_cost}
-    current_date = start_date
-    print(f"Fetching data from {start_date.strftime('%y%m%d')} to {end_date.strftime('%y%m%d')}")
-
-    while current_date <= end_date:
-        file_name = f"{current_date.strftime('%y%m%d')}{FILE_SUFFIX}"
-        try:
-            print(f"Attempting to get object: {file_name} from bucket: {bucket}")
-            response = s3_client.get_object(Bucket=bucket, Key=file_name)
-            content = response['Body'].read().decode('utf-8')
-            csv_reader = csv.reader(io.StringIO(content))
-            header = next(csv_reader) # 헤더 건너뛰기
-
-            # 컬럼 인덱스 찾기 (대소문자 구분 없이)
-            try:
-                service_col = next(i for i, col in enumerate(header) if col.lower() == 'service')
-                operation_col = next(i for i, col in enumerate(header) if col.lower() == 'operation')
-                cost_col = next(i for i, col in enumerate(header) if col.lower() == 'cost')
-            except StopIteration:
-                print(f"Error: Required columns (Service, Operation, Cost) not found in {file_name}")
-                continue # 다음 파일 처리
-
-            for row in csv_reader:
-                # 행 길이 확인 및 데이터 유효성 검사
-                if len(row) > max(service_col, operation_col, cost_col):
-                    try:
-                        service = row[service_col]
-                        operation = row[operation_col]
-                        cost_str = row[cost_col]
-                        cost = float(cost_str)
-                        resource_key = f"{service}::{operation}"
-                        costs[resource_key] = costs.get(resource_key, 0.0) + cost
-                    except ValueError:
-                        print(f"Warning: Could not parse cost '{cost_str}' in row: {row} from file {file_name}. Skipping row.")
-                    except IndexError:
-                         print(f"Warning: Row {row} in file {file_name} does not have enough columns. Skipping row.")
-                else:
-                     print(f"Warning: Row {row} in file {file_name} does not have enough columns. Skipping row.")
-
-
-        except s3_client.exceptions.NoSuchKey:
-            print(f"Info: File not found for date {current_date.strftime('%y%m%d')}: {file_name}")
-        except Exception as e:
-            print(f"Error reading file {file_name}: {e}")
-
-        current_date += timedelta(days=1)
-
-    print(f"Finished fetching data. Found {len(costs)} distinct resources.")
-    return costs
-
+# Lambda 핸들러 함수
 def lambda_handler(event, context):
-    """Lambda 함수 핸들러"""
-    today = datetime.today().date()
+    """Lambda 핸들러: 비용 분석 후 잠재적 미사용 리소스의 ID를 Athena에서 조회"""
+    print("--- Starting Unused Resource Identification Lambda --- ")
 
-    # 최근 기간 정의
-    recent_end_date = today - timedelta(days=1) # 오늘 제외, 어제까지
-    recent_start_date = recent_end_date - timedelta(days=RECENT_PERIOD_DAYS - 1)
+    potentially_unused_resource_details = []
+    found_resource_ids = []
+    status_code = 500
+    message = "Lambda execution started."
 
-    # 비교 기간 정의
-    comparison_end_date = recent_start_date - timedelta(days=1)
-    comparison_start_date = comparison_end_date - timedelta(days=COMPARISON_PERIOD_DAYS - 1)
+    try:
+        # 1. 비용 분석 모듈 호출하여 잠재적 미사용 리소스 정보 얻기
+        print("\nStep 1: Analyzing cost data using cost_analyzer...")
+        potentially_unused_resource_details = cost_analyzer.find_potentially_unused_resources()
+        cost_analysis_message = f"Cost analysis identified {len(potentially_unused_resource_details)} potentially unused Service::Operation pairs based on cost decrease."
+        print(cost_analysis_message)
+        print(f"  Details (first 5): {potentially_unused_resource_details[:5]}")
 
-    print("Calculating costs for comparison period...")
-    comparison_costs = get_costs_for_period(S3_BUCKET_NAME, comparison_start_date, comparison_end_date)
+        # 2. Athena 쿼리 실행 (잠재적 미사용 리소스가 있을 경우)
+        if not potentially_unused_resource_details:
+            print("\nStep 2: No potentially unused resources found by cost analysis. Skipping Athena query.")
+            message = cost_analysis_message + " No resource IDs to query."
+            status_code = 200
+        else:
+            print(f"\nStep 2: Querying Athena for resource IDs with cost yesterday...")
+            # athena_query_handler 모듈의 함수 호출
+            found_resource_ids = athena_query_handler.get_resource_ids_with_cost_yesterday(
+                potentially_unused_resource_details
+            )
+            message = f"{cost_analysis_message} Found {len(found_resource_ids)} unique resource IDs with costs yesterday for the associated services."
+            status_code = 200
 
-    print("Calculating costs for recent period...")
-    recent_costs = get_costs_for_period(S3_BUCKET_NAME, recent_start_date, recent_end_date)
+    except ValueError as ve: # 환경 변수 오류 등
+        message = f"Configuration error: {ve}"
+        print(message)
+        status_code = 400 # 설정 오류는 Bad Request 로 처리
+    except Exception as e: # 비용 분석 또는 Athena 쿼리 중 발생한 모든 예외
+        message = f"An error occurred: {e}"
+        print(f"Error during execution: {e}")
+        import traceback
+        traceback.print_exc()
+        status_code = 500 # 내부 서버 오류
 
-    unused_resources = []
-    cost_threshold_ratio = COST_THRESHOLD_PERCENTAGE / 100.0
+    print(f"--- Lambda Finished (Status: {status_code}) --- ")
 
-    print("Identifying potentially unused resources...")
-    for resource, comp_cost in comparison_costs.items():
-        if comp_cost > 0: # 비교 기간에 비용이 발생한 리소스만 확인
-            recent_cost = recent_costs.get(resource, 0.0)
-            # 최근 비용이 0이거나, 비교 기간 비용의 임계 비율 미만인 경우
-            if recent_cost < (comp_cost * cost_threshold_ratio):
-                unused_resources.append({
-                    "resource": resource,
-                    "comparison_period_cost": comp_cost,
-                    "recent_period_cost": recent_cost
-                })
-                print(f"  - Found potential unused resource: {resource} (Recent: {recent_cost:.6f}, Comparison: {comp_cost:.6f})")
-
-    print(f"Identified {len(unused_resources)} potentially unused resources.")
-
+    # 최종 응답 반환
     return {
-        'statusCode': 200,
-        'body': {
-            'potentially_unused_resources': unused_resources,
-            'comparison_period': f"{comparison_start_date.strftime('%Y-%m-%d')} to {comparison_end_date.strftime('%Y-%m-%d')}",
-            'recent_period': f"{recent_start_date.strftime('%Y-%m-%d')} to {recent_end_date.strftime('%Y-%m-%d')}"
-        }
+        'statusCode': status_code,
+        'body': json.dumps({
+            'message': message,
+            # 비용 분석 결과 상세 정보는 로깅으로 확인하고, 최종 응답에는 ID 목록만 포함 (필요시 수정 가능)
+            # 'potentially_unused_resource_details': potentially_unused_resource_details,
+            'resource_ids_with_cost_yesterday': found_resource_ids
+        }, indent=2)
     }
 
-# 로컬 테스트용 (Lambda 환경에서는 실행되지 않음)
+# --- 로컬 테스트용 코드 (수정 불필요) ---
 if __name__ == '__main__':
-    # 테스트를 위해 S3_BUCKET_NAME 환경 변수 설정 필요
-    # 예: os.environ['S3_BUCKET_NAME'] = 'your-test-bucket'
-    # 로컬에 AWS 자격 증명이 설정되어 있어야 함
-    if 'S3_BUCKET_NAME' not in os.environ or os.environ['S3_BUCKET_NAME'] == 'your-cost-data-bucket-name':
-         print("Please set the 'S3_BUCKET_NAME' environment variable for local testing.")
-    else:
-        result = lambda_handler(None, None)
-        import json
-        print("--- Function Result ---")
-        print(json.dumps(result, indent=2)) 
+    # 로컬 테스트 실행
+    print("--- Running lambda_handler locally ---")
+    # 필요한 경우 로컬 테스트용 AWS 자격 증명 설정
+    # 예: import boto3; boto3.setup_default_session(profile_name='your-aws-profile')
+
+    # TODO: 로컬 테스트 시 필요한 환경 변수 설정 확인
+    # os.environ['S3_BUCKET_NAME'] = '...'
+    # os.environ['COST_THRESHOLD_PERCENTAGE'] = '1.0'
+    # os.environ['MIN_COMPARISON_COST'] = '0.01'
+    # os.environ['ATHENA_DATABASE'] = '...'
+    # os.environ['ATHENA_TABLE'] = '...'
+    # os.environ['ATHENA_QUERY_OUTPUT_LOCATION'] = '...'
+    # os.environ['RECENT_PERIOD_DAYS'] = '7'
+    # os.environ['COMPARISON_PERIOD_DAYS'] = '30'
+
+    result = lambda_handler(None, None)
+    print("\n--- Function Result ---")
+    try:
+        print(f"Status Code: {result.get('statusCode')}")
+        body_content = json.loads(result.get('body', '{}'))
+        print("Body:")
+        print(json.dumps(body_content, indent=2))
+    except Exception as e:
+            print(f"Error parsing result: {e}")
+            print(result)
