@@ -3,6 +3,7 @@ import logging
 import os
 from analyzer.unattach_analyzer import find_unattached_resources
 from analyzer.unused_analyzer import find_unused_resource
+from delete.delete_handler import delete_handler
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO').upper())
@@ -16,12 +17,14 @@ def lambda_handler(event, context):
     event (dict): 입력 이벤트 객체. 다음 키를 포함해야 함:
         - operation (str): 수행할 작업 ('analyze' 또는 'execute').
         - (선택) arn_id (str): eip, eni ID (analyze 및 execute에 사용).
-        
+        - (선택) region (str): 리전 (analyze 및 execute에 사용).
     """
     
     logger.info(f"Received event: {json.dumps(event)}")
 
     operation = event.get('operation')
+    arn_id = event.get('arn_id')
+    region = event.get('region')
     
     if not operation:
         logger.error("필수 파라미터 누락: 'operation'과 'region'이 필요합니다.")
@@ -39,6 +42,15 @@ def lambda_handler(event, context):
                 'unattach_id': unattach_id,
                 'unused_id': unused_id
             }
+        elif operation == 'execute':
+            if arn_id and region:
+                delete_handler(region, arn_id)
+                status_code = 200
+                response_body = {'message': f"Successfully deleted {arn_id} in {region}"}
+            else:
+                logger.error("필수 파라미터 누락: 'arn_id'와 'region'이 필요합니다.")
+                status_code = 400
+                response_body = {'error': "Missing required parameters: arn_id, region"}
         else:
             logger.error(f"지원되지 않는 작업 유형: {operation}")
             status_code = 400
